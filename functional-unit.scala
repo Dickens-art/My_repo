@@ -481,7 +481,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
       val msb = Mux(a === 0.S || a === -1.S, ea(vaddrBits), !ea(vaddrBits-1))
       Cat(msb, ea(vaddrBits-1,0))
     }
-
+        
 
     val jalr_target_base = io.req.bits.rs1_data.asSInt
     val jalr_target_xlen = Wire(UInt(xLen.W))
@@ -523,7 +523,7 @@ class ALUUnit(isJmpUnit: Boolean = false, numStages: Int = 1, dataWidth: Int)(im
     Mux(io.req.bits.uop.ldst_is_rs1, io.req.bits.rs1_data, io.req.bits.rs2_data),          //如果预测错误，选择rs1，否则选择rs2
     Mux(io.req.bits.uop.uopc === uopMOV, io.req.bits.rs2_data, alu.io.out))               //
 
- val alu_out_securitytag = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,           
+  val alu_out_securitytag = Mux(io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data,           
     Mux(io.req.bits.uop.ldst_is_rs1, io.req.bits.rs1_data_securitytag, io.req.bits.rs2_data_securitytag),          
     Mux(io.req.bits.uop.uopc === uopMOV, io.req.bits.rs2_data_securitytag, alu.io.out_securitytag))               
 
@@ -816,6 +816,10 @@ class DivUnit(dataWidth: Int)(implicit p: Parameters)
   div.io.req.bits.in2 := io.req.bits.rs2_data
   div.io.req.bits.tag := DontCare
   io.req.ready        := div.io.req.ready
+  //***********************************************输入接口传递**********************************************************
+  div.io.req.bits.in1_security_tag := io.req.bits.rs1_data_securitytag
+  div.io.req.bits.in2_security_tag := io.req.bits.rs2_data_securitytag
+//*************************************************输入接口传递**********************************************************
 
   // handle pipeline kills and branch misspeculations
   div.io.kill         := this.do_kill
@@ -824,6 +828,9 @@ class DivUnit(dataWidth: Int)(implicit p: Parameters)
   io.resp.valid       := div.io.resp.valid && !this.do_kill
   div.io.resp.ready   := io.resp.ready
   io.resp.bits.data   := div.io.resp.bits.data
+  //***********************************************输出接口传递**********************************************************
+  io.resp.bits.data_securitytag := div.io.resp.bits.out_secutrity_tag
+//*************************************************输出接口传递**********************************************************
 }
 
 /**
@@ -849,6 +856,15 @@ class PipelinedMulUnit(numStages: Int, dataWidth: Int)(implicit p: Parameters)
   imul.io.req.bits.in1 := io.req.bits.rs1_data
   imul.io.req.bits.in2 := io.req.bits.rs2_data
   imul.io.req.bits.tag := DontCare
+//***********************************************输入接口传递**********************************************************
+  imul.io.req.bits.in1_security_tag := io.req.bits.rs1_data_securitytag
+  imul.io.req.bits.in2_security_tag := io.req.bits.rs2_data_securitytag
+//***********************************************输入接口传递**********************************************************
+
   // response
   io.resp.bits.data    := imul.io.resp.bits.data
+//***********************************************输出接口传递**********************************************************
+  io.resp.bits.data_securitytag := imul.io.resp.bits.out_secutrity_tag
+//***********************************************输出接口传递**********************************************************
+
 }
