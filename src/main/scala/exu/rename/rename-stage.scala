@@ -1,0 +1,437 @@
+//******************************************************************************
+// Copyright (c) 2012 - 2019, The Regents of the University of California (Regents).
+// All Rights Reserved. See LICENSE and LICENSE.SiFive for license details.
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// RISCV Processor Datapath: Rename Logic
+//重命名逻辑
+//当进行重命名时，对于操作数而言，首先根据重命名映射表进行转换，
+//并通过BusyTable判断该寄存器是否可读（不可读的情况则为RAW，无法解决只能等待）；
+//对于目标寄存器而言，在Free List中找到一个空闲状态的寄存器为它分配，同时将BusyTable对应表项置位，并更新重命名映射表。
+
+
+//RenameStage 模块描述了整个重命名阶段的操作流程，包括 Rename 模块与外部信号的连接、内部子模块之间的互联、流水线时序逻辑等。
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+//
+// Supports 1-cycle and 2-cycle latencies. (aka, passthrough versus registers between ren1 and ren2).
+//    - ren1: read the map tables and allocate a new physical register from the freelist.
+//    - ren2: read the busy table for the physical operands.
+//
+// Ren1 data is provided as an output to be fed directly into the ROB.
+
+package boom.exu
+
+import chisel3._
+import chisel3.util._
+
+import freechips.rocketchip.config.Parameters
+
+import boom.common._
+import boom.util._
+
+/**
+ * IO bundle to interface with the Register Rename logic
+ *
+ * @param plWidth pipeline width
+ * @param numIntPregs number of int physical registers
+ * @param numFpPregs number of FP physical registers
+ * @param numWbPorts number of int writeback ports
+ * @param numWbPorts number of FP writeback ports
+ */
+class RenameStageIO(
+  val plWidth: Int,
+  val numPhysRegs: Int,
+  val numWbPorts: Int)
+  (implicit p: Parameters) extends BoomBundle
+
+
+/**
+ * IO bundle to debug the rename stage
+ */
+class DebugRenameStageIO(val numPhysRegs: Int)(implicit p: Parameters) extends BoomBundle
+{
+  val freelist  = Bits(numPhysRegs.W)
+  val isprlist  = Bits(numPhysRegs.W)
+  val busytable = UInt(numPhysRegs.W)
+}
+
+//Security_Tag
+abstract class AbstractRenameStage(                 //抽象定义
+  plWidth: Int,                                                                  //
+  numPhysRegs: Int,                                                     //物理寄存器数量
+  numWbPorts: Int)                                                       //写回端口
+  (implicit p: Parameters) extends BoomModule
+{
+  val io = IO(new Bundle {                                                            //Rename模块与其他模块的连接 
+    val ren_stalls = Output(Vec(plWidth, Bool()))                //流水线暂停
+
+    val kill = Input(Bool())                                                              //终止信号
+    
+    //来自decode的
+    val dec_fire  = Input(Vec(plWidth, Bool()))                                                            // will commit state updates
+    val dec_uops  = Input(Vec(plWidth, new MicroOp()))                                       //输入指令的微码
+    
+    val dec_uops_securitytag = Input(Vec(plWidth, UInt(2.W)))                                //输入指令的securitytag，来自解码单元
+
+    // physical specifiers available AND busy/ready status available.
+    //rename输出信息
+    val ren2_mask = Vec(plWidth, Output(Bool()))                                                  // mask of valid instructions
+    val ren2_uops = Vec(plWidth, Output(new MicroOp()))                                 //输出的微指令
+    val ren2_uops_securitytag = Output(Vec(plWidth, UInt(2.W)))                         //输出securitytag
+
+    // branch resolution (execute)  从exe输入的分支信息
+    val brupdate = Input(new BrUpdateInfo())
+
+    //来自dispatch输入
+    val dis_fire  = Input(Vec(coreWidth, Bool()))                                                       //派遣级完成指令派遣的信号
+    val dis_ready = Input(Bool())                                                                                     //派遣级可以接收数据的ready信号
+
+    // wakeup ports
+    val wakeups = Flipped(Vec(numWbPorts, Valid(new ExeUnitResp(xLen))))
+
+    // commit stage
+    val com_valids = Input(Vec(plWidth, Bool()))                                                     //指令是否提交的信号
+    val com_uops = Input(Vec(plWidth, new MicroOp()))                                     //提交阶段的微指令
+    val rbk_valids = Input(Vec(plWidth, Bool()))                                                       //指令是否回滚的信号
+    val rollback = Input(Bool())                                                                                        //回滚总使能信号
+
+    val debug_rob_empty = Input(Bool())
+    val debug = Output(new DebugRenameStageIO(numPhysRegs))
+  })
+
+  def BypassAllocations(uop: MicroOp, older_uops: Seq[MicroOp], alloc_reqs: Seq[Bool]): MicroOp
+
+  //-------------------------------------------------------------
+  // Pipeline State & Wires
+
+  // Stage 1
+  val ren1_fire       = Wire(Vec(plWidth, Bool()))
+  val ren1_uops       = Wire(Vec(plWidth, new MicroOp))
+
+  val ren1_uops_securitytag = Wire(Vec(plWidth, UInt(2.W)))           //来自dec的uop及tag
+
+  // Stage 2
+  val ren2_fire       = io.dis_fire
+  val ren2_ready      = io.dis_ready
+  val ren2_valids     = Wire(Vec(plWidth, Bool()))
+  val ren2_uops       = Wire(Vec(plWidth, new MicroOp))
+
+  val ren2_uops_securitytag = Wire(Vec(plWidth, UInt(2.W)))       //tag
+
+  val ren2_alloc_reqs = Wire(Vec(plWidth, Bool()))
+
+
+  //-------------------------------------------------------------
+  // pipeline registers
+
+  for (w <- 0 until plWidth) {
+    ren1_fire(w)          := io.dec_fire(w)
+    ren1_uops(w)          := io.dec_uops(w)                                        //来自dec的uop及tag
+    ren1_uops_securitytag(w) := io.dec_uops_securitytag(w)
+  }
+
+  for (w <- 0 until plWidth) {
+    val r_valid  = RegInit(false.B)
+    val r_uop    = Reg(new MicroOp)
+    val r_uop_securitytag = Reg(UInt(2.W))
+    val next_uop = Wire(new MicroOp)
+    val next_uop_securitytag = Wire(UInt(2.W))
+
+    next_uop := r_uop                                   //默认为保存在r里的微指令                                  
+    next_uop_securitytag := r_uop_securitytag
+
+    when (io.kill) {                                           //微指令的传递（ren1到ren2，r为暂存）
+      r_valid := false.B
+    } .elsewhen (ren2_ready) {                   //派遣准备好接收新的微指令，next_uop更新为下一条指令译码得到的微指令
+      r_valid := ren1_fire(w)
+      next_uop := ren1_uops(w)
+      next_uop_securitytag := ren1_uops_securitytag(w)
+    } .otherwise {                                             //派遣级没准备好接受新的微指令，若前一条指令已经完成派遣，r_valid信号置0，next_uop保持
+      r_valid := r_valid && !ren2_fire(w) // clear bit if uop gets dispatched
+      next_uop := r_uop
+      next_uop_securitytag := r_uop_securitytag
+    }
+
+    //ren2_uop 输出重命名之后的微指令，信息保存在寄存器 r_uop 中
+    //ren2_valids输出微指令的有效信号，信息保存在寄存器 r_valid 中
+    //GetNewUopAndBrMask根据输入的分支信息更新 uop 中的 br_mask
+    r_uop := GetNewUopAndBrMask(BypassAllocations(next_uop, ren2_uops, ren2_alloc_reqs), io.brupdate)
+    r_uop_securitytag := next_uop_securitytag
+
+    ren2_valids(w) := r_valid
+    ren2_uops(w)   := r_uop
+    ren2_uops_securitytag(w) := r_uop_securitytag             //tag
+  }
+
+  //-------------------------------------------------------------
+  // Outputs
+
+  io.ren2_mask := ren2_valids
+
+
+}
+
+//Security_Tag
+/**
+ * Rename stage that connets the map table, free list, and busy table.
+ * Can be used in both the FP pipeline and the normal execute pipeline.
+ *
+ * @param plWidth pipeline width
+ * @param numWbPorts number of int writeback ports
+ * @param numWbPorts number of FP writeback ports
+ */
+class RenameStage(                                     
+  plWidth: Int,
+  numPhysRegs: Int,
+  numWbPorts: Int,
+  float: Boolean)
+(implicit p: Parameters) extends AbstractRenameStage(plWidth, numPhysRegs, numWbPorts)(p)
+{
+  val pregSz = log2Ceil(numPhysRegs)
+  val rtype = if (float) RT_FLT else RT_FIX
+
+  //-------------------------------------------------------------
+  // Helper Functions
+
+
+  //BypassAllocations根据历史指令处理微操作 uop，将发生RAW冲突的源操作数寄存器替换成对应的历史指令目的寄存器，
+  //并将需要 bypass 的寄存器的状态置为busy
+
+  def BypassAllocations(uop: MicroOp, older_uops: Seq[MicroOp], alloc_reqs: Seq[Bool]): MicroOp = {
+    val bypassed_uop = Wire(new MicroOp)
+    bypassed_uop := uop
+
+    val bypass_hits_rs1 = (older_uops zip alloc_reqs) map { case (r,a) => a && r.ldst === uop.lrs1 }
+    val bypass_hits_rs2 = (older_uops zip alloc_reqs) map { case (r,a) => a && r.ldst === uop.lrs2 }
+    val bypass_hits_rs3 = (older_uops zip alloc_reqs) map { case (r,a) => a && r.ldst === uop.lrs3 }
+    val bypass_hits_dst = (older_uops zip alloc_reqs) map { case (r,a) => a && r.ldst === uop.ldst }
+
+    val bypass_sel_rs1 = PriorityEncoderOH(bypass_hits_rs1.reverse).reverse
+    val bypass_sel_rs2 = PriorityEncoderOH(bypass_hits_rs2.reverse).reverse
+    val bypass_sel_rs3 = PriorityEncoderOH(bypass_hits_rs3.reverse).reverse
+    val bypass_sel_dst = PriorityEncoderOH(bypass_hits_dst.reverse).reverse
+
+    val do_bypass_rs1 = bypass_hits_rs1.reduce(_||_)
+    val do_bypass_rs2 = bypass_hits_rs2.reduce(_||_)
+    val do_bypass_rs3 = bypass_hits_rs3.reduce(_||_)
+    val do_bypass_dst = bypass_hits_dst.reduce(_||_)
+
+    val bypass_pdsts = older_uops.map(_.pdst)
+
+    when (do_bypass_rs1) { bypassed_uop.prs1       := Mux1H(bypass_sel_rs1, bypass_pdsts) }
+    when (do_bypass_rs2) { bypassed_uop.prs2       := Mux1H(bypass_sel_rs2, bypass_pdsts) }
+    when (do_bypass_rs3) { bypassed_uop.prs3       := Mux1H(bypass_sel_rs3, bypass_pdsts) }
+    when (do_bypass_dst) { bypassed_uop.stale_pdst := Mux1H(bypass_sel_dst, bypass_pdsts) }
+
+    bypassed_uop.prs1_busy := uop.prs1_busy || do_bypass_rs1
+    bypassed_uop.prs2_busy := uop.prs2_busy || do_bypass_rs2
+    bypassed_uop.prs3_busy := uop.prs3_busy || do_bypass_rs3
+
+    if (!float) {
+      bypassed_uop.prs3      := DontCare
+      bypassed_uop.prs3_busy := false.B
+    }
+
+    bypassed_uop
+  }
+
+  //-------------------------------------------------------------
+  // Rename Structures
+
+  val maptable = Module(new RenameMapTable(
+    plWidth,
+    32,
+    numPhysRegs,
+    false,
+    float))
+  val freelist = Module(new RenameFreeList(
+    plWidth,
+    numPhysRegs,
+    if (float) 32 else 31))
+  val busytable = Module(new RenameBusyTable(
+    plWidth,
+    numPhysRegs,
+    numWbPorts,
+    false,
+    float))
+
+
+
+  val ren2_br_tags    = Wire(Vec(plWidth, Valid(UInt(brTagSz.W))))
+
+  // Commit/Rollback
+  val com_valids      = Wire(Vec(plWidth, Bool()))
+  val rbk_valids      = Wire(Vec(plWidth, Bool()))
+
+  for (w <- 0 until plWidth) {
+    ren2_alloc_reqs(w)    := ren2_uops(w).ldst_val && ren2_uops(w).dst_rtype === rtype && ren2_fire(w)
+    ren2_br_tags(w).valid := ren2_fire(w) && ren2_uops(w).allocate_brtag
+
+    com_valids(w)         := io.com_uops(w).ldst_val && io.com_uops(w).dst_rtype === rtype && io.com_valids(w)
+    rbk_valids(w)         := io.com_uops(w).ldst_val && io.com_uops(w).dst_rtype === rtype && io.rbk_valids(w)
+    ren2_br_tags(w).bits  := ren2_uops(w).br_tag
+  }
+
+  //-------------------------------------------------------------
+  // Rename Table
+
+  // Maptable inputs.
+  val map_reqs   = Wire(Vec(plWidth, new MapReq(lregSz)))
+  val remap_reqs = Wire(Vec(plWidth, new RemapReq(lregSz, pregSz)))
+
+  // Generate maptable requests.
+  for ((((ren1,ren2),com),w) <- ren1_uops zip ren2_uops zip io.com_uops.reverse zipWithIndex) {
+    map_reqs(w).lrs1 := ren1.lrs1
+    map_reqs(w).lrs2 := ren1.lrs2
+    map_reqs(w).lrs3 := ren1.lrs3
+    map_reqs(w).ldst := ren1.ldst
+
+    remap_reqs(w).ldst := Mux(io.rollback, com.ldst      , ren2.ldst)
+    remap_reqs(w).pdst := Mux(io.rollback, com.stale_pdst, ren2.pdst)
+  }
+  ren2_alloc_reqs zip rbk_valids.reverse zip remap_reqs map {
+    case ((a,r),rr) => rr.valid := a || r}
+
+  // Hook up inputs.
+  maptable.io.map_reqs    := map_reqs
+  maptable.io.remap_reqs  := remap_reqs
+  maptable.io.ren_br_tags := ren2_br_tags
+  maptable.io.brupdate      := io.brupdate
+  maptable.io.rollback    := io.rollback
+
+  // Maptable outputs.
+  for ((uop, w) <- ren1_uops.zipWithIndex) {
+    val mappings = maptable.io.map_resps(w)
+
+    uop.prs1       := mappings.prs1
+    uop.prs2       := mappings.prs2
+    uop.prs3       := mappings.prs3 // only FP has 3rd operand
+    uop.stale_pdst := mappings.stale_pdst
+  }
+
+
+
+  //-------------------------------------------------------------
+  // Free List
+
+  // Freelist inputs.
+  freelist.io.reqs := ren2_alloc_reqs
+  freelist.io.dealloc_pregs zip com_valids zip rbk_valids map
+    {case ((d,c),r) => d.valid := c || r}
+  freelist.io.dealloc_pregs zip io.com_uops map
+    {case (d,c) => d.bits := Mux(io.rollback, c.pdst, c.stale_pdst)}
+  freelist.io.ren_br_tags := ren2_br_tags
+  freelist.io.brupdate := io.brupdate
+  freelist.io.debug.pipeline_empty := io.debug_rob_empty
+
+  assert (ren2_alloc_reqs zip freelist.io.alloc_pregs map {case (r,p) => !r || p.bits =/= 0.U} reduce (_&&_),
+           "[rename-stage] A uop is trying to allocate the zero physical register.")
+
+  // Freelist outputs.
+  for ((uop, w) <- ren2_uops.zipWithIndex) {
+    val preg = freelist.io.alloc_pregs(w).bits
+    uop.pdst := Mux(uop.ldst =/= 0.U || float.B, preg, 0.U)
+  }
+
+  //-------------------------------------------------------------
+  // Busy Table
+
+  busytable.io.ren_uops := ren2_uops  // expects pdst to be set up.
+  busytable.io.rebusy_reqs := ren2_alloc_reqs
+  busytable.io.wb_valids := io.wakeups.map(_.valid)
+  busytable.io.wb_pdsts := io.wakeups.map(_.bits.uop.pdst)
+
+  assert (!(io.wakeups.map(x => x.valid && x.bits.uop.dst_rtype =/= rtype).reduce(_||_)),
+   "[rename] Wakeup has wrong rtype.")
+
+  for ((uop, w) <- ren2_uops.zipWithIndex) {
+    val busy = busytable.io.busy_resps(w)
+
+    uop.prs1_busy := uop.lrs1_rtype === rtype && busy.prs1_busy
+    uop.prs2_busy := uop.lrs2_rtype === rtype && busy.prs2_busy
+    uop.prs3_busy := uop.frs3_en && busy.prs3_busy
+
+    val valid = ren2_valids(w)
+    assert (!(valid && busy.prs1_busy && rtype === RT_FIX && uop.lrs1 === 0.U), "[rename] x0 is busy??")
+    assert (!(valid && busy.prs2_busy && rtype === RT_FIX && uop.lrs2 === 0.U), "[rename] x0 is busy??")
+  }
+
+  //-------------------------------------------------------------
+  // Outputs
+
+  for (w <- 0 until plWidth) {
+    val can_allocate = freelist.io.alloc_pregs(w).valid
+
+    // Push back against Decode stage if Rename1 can't proceed.
+    io.ren_stalls(w) := (ren2_uops(w).dst_rtype === rtype) && !can_allocate
+
+    val bypassed_uop = Wire(new MicroOp)
+    val bypassed_uop_securitytag = Wire(UInt(2.W))
+    if (w > 0) bypassed_uop := BypassAllocations(ren2_uops(w), ren2_uops.slice(0,w), ren2_alloc_reqs.slice(0,w))
+    else       bypassed_uop := ren2_uops(w)
+    bypassed_uop_securitytag := ren2_uops_securitytag(w)             //tag
+
+    io.ren2_uops(w) := GetNewUopAndBrMask(bypassed_uop, io.brupdate)
+    io.ren2_uops_securitytag(w) := bypassed_uop_securitytag
+  }
+
+  //-------------------------------------------------------------
+  // Debug signals
+
+  io.debug.freelist  := freelist.io.debug.freelist
+  io.debug.isprlist  := freelist.io.debug.isprlist
+  io.debug.busytable := busytable.io.debug.busytable
+}
+
+class PredRenameStage(
+  plWidth: Int,
+  numPhysRegs: Int,
+  numWbPorts: Int)
+  (implicit p: Parameters) extends AbstractRenameStage(plWidth, numPhysRegs, numWbPorts)(p)
+{
+
+  def BypassAllocations(uop: MicroOp, older_uops: Seq[MicroOp], alloc_reqs: Seq[Bool]): MicroOp = {
+    uop
+  }
+
+  ren2_alloc_reqs := DontCare
+
+  val busy_table = RegInit(VecInit(0.U(ftqSz.W).asBools))
+  val to_busy = WireInit(VecInit(0.U(ftqSz.W).asBools))
+  val unbusy = WireInit(VecInit(0.U(ftqSz.W).asBools))
+
+  val current_ftq_idx = Reg(UInt(log2Ceil(ftqSz).W))
+  var next_ftq_idx = current_ftq_idx
+
+  for (w <- 0 until plWidth) {
+    io.ren2_uops(w) := ren2_uops(w)
+
+    val is_sfb_br = ren2_uops(w).is_sfb_br && ren2_fire(w)
+    val is_sfb_shadow = ren2_uops(w).is_sfb_shadow && ren2_fire(w)
+
+    val ftq_idx = ren2_uops(w).ftq_idx
+    when (is_sfb_br) {
+      io.ren2_uops(w).pdst := ftq_idx
+      to_busy(ftq_idx) := true.B
+    }
+    next_ftq_idx = Mux(is_sfb_br, ftq_idx, next_ftq_idx)
+
+    when (is_sfb_shadow) {
+      io.ren2_uops(w).ppred := next_ftq_idx
+      io.ren2_uops(w).ppred_busy := (busy_table(next_ftq_idx) || to_busy(next_ftq_idx)) && !unbusy(next_ftq_idx)
+    }
+  }
+
+  for (w <- 0 until numWbPorts) {
+    when (io.wakeups(w).valid) {
+      unbusy(io.wakeups(w).bits.uop.pdst) := true.B
+    }
+  }
+
+  current_ftq_idx := next_ftq_idx
+
+  busy_table := ((busy_table.asUInt | to_busy.asUInt) & ~unbusy.asUInt).asBools
+}
